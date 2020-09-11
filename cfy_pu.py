@@ -2,7 +2,7 @@
 
 from os.path import join
 from os import environ
-import uuid
+from uuid import uuid4
 
 from dsl_parser.constants import (PLUGIN_NAME_KEY,
                                   WORKFLOW_PLUGINS_TO_INSTALL,
@@ -10,13 +10,12 @@ from dsl_parser.constants import (PLUGIN_NAME_KEY,
                                   HOST_AGENT_PLUGINS_TO_INSTALL)
 
 from manager_rest.constants import FILE_SERVER_BLUEPRINTS_FOLDER
-from manager_rest.flask_utils import setup_flask_app
+from manager_rest.flask_utils import setup_flask_app, set_admin_current_user
 from manager_rest.plugins_update.constants import (STATES,
                                                    ACTIVE_STATES)
 from manager_rest.resource_manager import get_resource_manager
 from manager_rest.storage import models, storage_manager, get_storage_manager
 from manager_rest import config, resource_manager, utils
-
 
 REST_HOME_DIR = '/opt/manager'
 REST_CONFIG_PATH = join(REST_HOME_DIR, 'cloudify-rest.conf')
@@ -24,13 +23,13 @@ REST_SECURITY_CONFIG_PATH = join(REST_HOME_DIR, 'rest-security.conf')
 REST_AUTHORIZATION_CONFIG_PATH = join(REST_HOME_DIR, 'authorization.conf')
 
 
-
 def validate_no_active_updates_per_blueprint(
         sm: storage_manager.SQLStorageManager,
         blueprint: models.Blueprint):
     active_updates = sm.list(
         models.PluginsUpdate,
-        filters={'blueprint_id': blueprint.id, 'state': ACTIVE_STATES}
+        filters={'blueprint_id': blueprint.id, 'state': ACTIVE_STATES},
+        all_tenants=True,
     )
     if active_updates:
         raise Exception(
@@ -50,7 +49,8 @@ def did_plugins_to_install_change(temp_plan, plan) -> bool:
                          HOST_AGENT_PLUGINS_TO_INSTALL])
 
 
-def did_executor_plugins_to_install_change(temp_plan, plan, plugins_executor):
+def did_executor_plugins_to_install_change(
+        temp_plan, plan, plugins_executor) -> bool:
     temp_plugins = temp_plan[plugins_executor]
     current_plugins = plan[plugins_executor]
     name_to_plugin = {p[PLUGIN_NAME_KEY]: p for p in current_plugins}
@@ -65,6 +65,7 @@ def get_reevaluated_plan(rm: resource_manager.ResourceManager,
         FILE_SERVER_BLUEPRINTS_FOLDER,
         blueprint.tenant.name,
         blueprint.id)
+    import pdb;  pdb.set_trace()  #noqa
     temp_plan = rm.parse_plan(blueprint_dir,
                               blueprint.main_file_name,
                               config.instance.file_server_root)
@@ -73,7 +74,7 @@ def get_reevaluated_plan(rm: resource_manager.ResourceManager,
 
 def stage_plugin_update(sm: storage_manager.SQLStorageManager,
                         blueprint: models.Blueprint) -> models.PluginsUpdate:
-    update_id = str(uuid.uuid4())
+    update_id = str(uuid4())
     plugins_update = models.PluginsUpdate(
         id=update_id,
         created_at=utils.get_formatted_timestamp(),
@@ -86,7 +87,7 @@ def create_temp_blueprint_from(sm: storage_manager.SQLStorageManager,
                                rm: resource_manager.ResourceManager,
                                blueprint: models.Blueprint,
                                temp_plan) -> models.Blueprint:
-    temp_blueprint_id = str(uuid.uuid4())
+    temp_blueprint_id = str(uuid4())
     kwargs = {
         'application_file_name': blueprint.main_file_name,
         'blueprint_id': temp_blueprint_id,
@@ -105,27 +106,35 @@ def create_temp_blueprint_from(sm: storage_manager.SQLStorageManager,
     return sm.update(temp_blueprint)
 
 
+def reevaluate_plugins_to_be_updated(temp_plan):
+    print('reevaluate_plugins_to_be_updated')
+    print(type(temp_plan))
+    return temp_plan
+
+
 def update_plugin(sm: storage_manager.SQLStorageManager,
                   rm: resource_manager.ResourceManager,
                   blueprint: models.Blueprint) -> models.PluginsUpdate:
     validate_no_active_updates_per_blueprint(sm, blueprint)
     temp_plan = get_reevaluated_plan(rm, blueprint)
+    temp_plan = reevaluate_plugins_to_be_updated(temp_plan)
     update_required = did_plugins_to_install_change(temp_plan, blueprint.plan)
     deployments_to_update = [d.id for d in
                              sm.list(models.Deployment,
                                      filters={'blueprint_id': blueprint.id},
-                                     sort={'id': 'asc'}).items]
+                                     sort={'id': 'asc'},
+                                     all_tenants=True).items]
     update_required &= len(deployments_to_update) > 0
     plugins_update = stage_plugin_update(sm, blueprint)
     if update_required:
         plugins_update.deployments_to_update = deployments_to_update
         sm.update(plugins_update)
-        temp_blueprint = create_temp_blueprint_from(sm, rm, blueprint, temp_plan)
+        temp_blueprint = create_temp_blueprint_from(sm, rm, blueprint,
+                                                    temp_plan)
         plugins_update.temp_blueprint = temp_blueprint
         plugins_update.state = STATES.UPDATING
         sm.update(plugins_update)
 
-    import pdb; pdb.set_trace()
     plugins_update.execution = rm.update_plugins(plugins_update,
                                                  not update_required)
     plugins_update.state = (STATES.NO_CHANGES_REQUIRED
@@ -144,12 +153,13 @@ if __name__ == '__main__':
         if value is not None:
             environ[envvar] = value
 
-    #import pdb; pdb.set_trace()
     config.instance.load_configuration()
-    setup_flask_app()
+    app = setup_flask_app()
+    set_admin_current_user(app)
     _sm = get_storage_manager()
     _rm = get_resource_manager(_sm)
-    for b in _sm.list(models.Blueprint):
+    # import pdb; pdb.set_trace()  # noqa
+    blueprints = _sm.list(models.Blueprint, all_tenants=True)
+    for b in blueprints.items:
+        print(f'Processing {b.id} blueprint')
         update_plugin(_sm, _rm, b)
-
-
