@@ -1,5 +1,6 @@
 #!/opt/manager/env/bin/python3
 
+import click
 from os.path import join
 from os import environ
 from uuid import uuid4
@@ -8,6 +9,7 @@ from dsl_parser.constants import (PLUGIN_NAME_KEY,
                                   WORKFLOW_PLUGINS_TO_INSTALL,
                                   DEPLOYMENT_PLUGINS_TO_INSTALL,
                                   HOST_AGENT_PLUGINS_TO_INSTALL)
+from dsl_parser.models import Plan
 
 from manager_rest.constants import FILE_SERVER_BLUEPRINTS_FOLDER
 from manager_rest.flask_utils import (setup_flask_app, set_admin_current_user,
@@ -208,7 +210,7 @@ def create_temp_blueprint_from(sm: storage_manager.SQLStorageManager,
     return sm.update(temp_blueprint)
 
 
-def list_plugins_in_a_plan(temp_plan):
+def list_plugins_in_a_plan(temp_plan: Plan) -> list:
     return [plugin
             for plugin in temp_plan['deployment_plugins_to_install'] +
             temp_plan['workflow_plugins_to_install'] +
@@ -216,25 +218,39 @@ def list_plugins_in_a_plan(temp_plan):
             if plugin[PACKAGE_NAME] and plugin[PACKAGE_VERSION]]
 
 
-def get_plugin_version(plugin_name, plugin_version):
-    if plugin_name not in CLOUDIFY_PLUGINS:
-        return plugin_version
-    return CLOUDIFY_PLUGINS[plugin_name][VERSIONS][0]
+def get_plugin_version(name: str, version: str, minor: bool) -> str:
+    if name not in CLOUDIFY_PLUGINS:
+        return version
+    if minor:
+        major_version = version.split('.')[0]
+        return next(v for v in CLOUDIFY_PLUGINS[name][VERSIONS]
+                    if v.startswith(major_version))
+    return CLOUDIFY_PLUGINS[name][VERSIONS][0]
 
 
-def suggest_plugin_versions(plugins):
+def suggest_plugin_versions(plugins: list,
+                            minor_only: bool,
+                            minor_except_names: tuple) -> dict:
     suggestions = {}
     for plugin in plugins:
         suggestions[plugin[PACKAGE_NAME]] = get_plugin_version(
-            plugin[PACKAGE_NAME], plugin[PACKAGE_VERSION])
+            plugin[PACKAGE_NAME], plugin[PACKAGE_VERSION],
+            minor_only or plugin[PACKAGE_NAME] in minor_except_names)
     return suggestions
 
 
-def reevaluate_plugins_to_be_updated(temp_plan):
+def reevaluate_plugins_to_be_updated(temp_plan: Plan,
+                                     minor_only: bool,
+                                     plugin_names: tuple,
+                                     minor_except_names: tuple) -> Plan:
     plugins_installed = list_plugins_in_a_plan(temp_plan)
+    if plugin_names:
+        plugins_installed = [p for p in plugins_installed
+                             if p[PACKAGE_NAME] in plugin_names]
     if not plugins_installed:
         return temp_plan
-    plugins_suggested = suggest_plugin_versions(plugins_installed)
+    plugins_suggested = suggest_plugin_versions(plugins_installed,
+                                                minor_only, minor_except_names)
     print('reevaluate_plugins_to_be_updated')
     print(f'PLUGINS INSTALLED\n\t{plugins_installed}')
     print(f'PLUGINS SUGGESTED\n\t{plugins_suggested}')
@@ -243,10 +259,14 @@ def reevaluate_plugins_to_be_updated(temp_plan):
 
 def update_plugin(sm: storage_manager.SQLStorageManager,
                   rm: resource_manager.ResourceManager,
-                  blueprint: models.Blueprint) -> models.PluginsUpdate:
+                  blueprint: models.Blueprint,
+                  minor_only: bool,
+                  plugin_names: tuple,
+                  minor_except_names: tuple) -> models.PluginsUpdate:
     validate_no_active_updates_per_blueprint(sm, blueprint)
     temp_plan = get_reevaluated_plan(rm, blueprint)
-    temp_plan = reevaluate_plugins_to_be_updated(temp_plan)
+    temp_plan = reevaluate_plugins_to_be_updated(
+        temp_plan, minor_only, plugin_names, minor_except_names)
     update_required = did_plugins_to_install_change(temp_plan, blueprint.plan)
     deployments_to_update = [d.id for d in
                              sm.list(models.Deployment,
@@ -271,6 +291,33 @@ def update_plugin(sm: storage_manager.SQLStorageManager,
     return sm.update(plugins_update)
 
 
+@click.command()
+@click.option('--tenant', default='default_tenant',
+              help='Tenant name')
+@click.option('--plugin-name', multiple=True,
+              help='Plugin to update')
+@click.option('--minor', is_flag=True,
+              help='Update to the latest minor release')
+@click.option('--minor-except', multiple=True,
+              help='Update plugins to the latest minor release, except '
+                   'the plugin(s) specified as the arguments')
+def main(tenant, plugin_name, minor, minor_except):
+    if minor and minor_except:
+        raise Exception('--minor and --minor-except options are '
+                        'mutually exclusive')
+
+    set_tenant_in_app(get_tenant_by_name(tenant))
+    _sm = get_storage_manager()
+    _rm = get_resource_manager(_sm)
+    # import pdb; pdb.set_trace()  # noqa
+    blueprints = _sm.list(models.Blueprint,
+                          filters={'id': 'bp'},
+                          all_tenants=True)
+    for b in blueprints.items:
+        print(f'Processing {b.id} blueprint')
+        update_plugin(_sm, _rm, b, minor, plugin_name, minor_except)
+
+
 if __name__ == '__main__':
     for value, envvar in [
         (REST_CONFIG_PATH, 'MANAGER_REST_CONFIG_PATH'),
@@ -284,13 +331,4 @@ if __name__ == '__main__':
     config.instance.load_configuration()
     app = setup_flask_app()
     set_admin_current_user(app)
-    set_tenant_in_app(get_tenant_by_name('default_tenant'))
-    _sm = get_storage_manager()
-    _rm = get_resource_manager(_sm)
-    # import pdb; pdb.set_trace()  # noqa
-    blueprints = _sm.list(models.Blueprint,
-                          filters={'id': 'bp'},
-                          all_tenants=True)
-    for b in blueprints.items:
-        print(f'Processing {b.id} blueprint')
-        update_plugin(_sm, _rm, b)
+    main()
