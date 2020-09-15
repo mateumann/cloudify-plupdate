@@ -1,8 +1,8 @@
 plugins:
     versioned_plugin:
-        executor: host_agent
+        executor: central_deployment_agent
         package_name: versioned-plugin
-        package_version: 0.0.1
+        package_version: 0.0.2
         source: null
         install: true
 
