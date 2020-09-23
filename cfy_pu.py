@@ -296,15 +296,15 @@ def scan_blueprint(blueprint: models.Blueprint,
 @click.option('--blueprint', 'blueprint_ids',
               multiple=True, help='Blueprint(s) to update (you can provide '
                                   'multiple --blueprint(s).')
-@click.option('--mapping', 'mapping_file', multiple=False,
+@click.option('--mapping', 'mapping_file', multiple=False, required=True,
               help='Provide a mapping file generated with ')
 @click.option('--correct', is_flag=True, default=False,
               help='Update the blueprints using provided mapping file.')
 def main(tenant, plugin_names, blueprint_ids, mapping_file, correct):
-    if correct and not mapping_file:
-        raise Exception('Blueprints modification (--correct) is possible '
-                        'only with a mapping file provided with --mapping '
-                        'parameter.')
+    # if correct and exists(mapping_file):
+    #     raise Exception('Blueprints modification (--correct) is possible '
+    #                     'only with an existing mapping file provided with '
+    #                     '--mapping parameter.')
 
     set_tenant_in_app(get_tenant_by_name(tenant))
     _sm = get_storage_manager()
@@ -317,7 +317,7 @@ def main(tenant, plugin_names, blueprint_ids, mapping_file, correct):
         if not mapping:
             continue
         mappings[b.id] = mapping
-    with open('/tmp/mappings.yaml', 'w') as f:
+    with open(mapping_file, 'w') as f:
         yaml.dump(mappings, f, default_flow_style=False)
 
 
