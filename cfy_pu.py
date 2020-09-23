@@ -4,11 +4,12 @@ import click
 import collections
 from os.path import join
 from os import environ
-from uuid import uuid4
+import requests
 import yaml
 
-from dsl_parser.constants import (PLUGIN_NAME_KEY,
-                                  WORKFLOW_PLUGINS_TO_INSTALL,
+from cloudify._compat import parse_qs
+
+from dsl_parser.constants import (WORKFLOW_PLUGINS_TO_INSTALL,
                                   DEPLOYMENT_PLUGINS_TO_INSTALL,
                                   HOST_AGENT_PLUGINS_TO_INSTALL,
                                   PLUGIN_PACKAGE_NAME,
@@ -18,11 +19,8 @@ from dsl_parser.models import Plan
 from manager_rest.constants import FILE_SERVER_BLUEPRINTS_FOLDER
 from manager_rest.flask_utils import (setup_flask_app, set_admin_current_user,
                                       get_tenant_by_name, set_tenant_in_app)
-from manager_rest.plugins_update.constants import (STATES,
-                                                   ACTIVE_STATES)
-from manager_rest.resource_manager import get_resource_manager
-from manager_rest.storage import models, storage_manager, get_storage_manager
-from manager_rest import config, resource_manager, utils
+from manager_rest.storage import models, get_storage_manager
+from manager_rest import config
 
 REST_HOME_DIR = '/opt/manager'
 REST_CONFIG_PATH = join(REST_HOME_DIR, 'cloudify-rest.conf')
@@ -30,14 +28,25 @@ REST_SECURITY_CONFIG_PATH = join(REST_HOME_DIR, 'rest-security.conf')
 REST_AUTHORIZATION_CONFIG_PATH = join(REST_HOME_DIR, 'authorization.conf')
 
 BLUEPRINT_LINE = 'blueprint_line'
-CURRENT = 'current'
+CURRENT_VERSION = 'current_version'
 EXECUTORS = [DEPLOYMENT_PLUGINS_TO_INSTALL,
              WORKFLOW_PLUGINS_TO_INSTALL,
              HOST_AGENT_PLUGINS_TO_INSTALL]
+
+FILE_NAME = 'file-name'
+FINE = 'fine'
 IMPORTS = 'imports'
+IS_PINNED = True
+IS_NOT_PINNED = False
+IS_UNKNOWN = True
+IS_NOT_UNKNOWN = False
+PINNED = 'pinned'
 REPO = 'repository'
 SOURCE = 'source'
-SUGGESTED = 'suggested'
+SUGGESTED_LINE = 'suggested_line'
+SUGGESTED_VERSION = 'suggested_version'
+UNHANDLED = 'unhandled'
+UNKNOWN = 'unknown'
 VERSIONS = 'versions'
 
 
@@ -118,14 +127,16 @@ CLOUDIFY_PLUGINS = {
         REPO: 'https://github.com/cloudify-cosmo/cloudify-ansible-plugin',
     },
     'cloudify-kubernetes-plugin': {
-      VERSIONS: sorted(['2.8.3', '2.8.2', '2.8.1', '2.8.0', '2.7.2', '2.7.1',
-                        '2.7.0', '2.6.5', '2.6.4', '2.6.3', '2.6.2', '2.6.0',
-                        '2.5.0', '2.4.1', '2.4.0', '2.3.2', '2.3.1', '2.3.0',
-                        '2.2.2', '2.2.1', '2.2.0', '2.1.0', '2.0.0.1', '2.0.0',
-                        '1.4.0', '1.3.1.1', '1.3.1', '1.3.0', '1.2.2', '1.2.1',
-                        '1.2.0', '1.1.0', '1.0.0'],
-                       key=_version_to_key, reverse=True),
-      REPO: 'https://github.com/cloudify-cosmo/cloudify-kubernetes-plugin',
+        VERSIONS: sorted(['2.8.3', '2.8.2', '2.8.1', '2.8.0', '2.7.2', '2.7.1',
+                          '2.7.0', '2.6.5', '2.6.4', '2.6.3', '2.6.2', '2.6.0',
+                          '2.5.0', '2.4.1', '2.4.0', '2.3.2', '2.3.1', '2.3.0',
+                          '2.2.2', '2.2.1', '2.2.0', '2.1.0', '2.0.0.1',
+                          '2.0.0',
+                          '1.4.0', '1.3.1.1', '1.3.1', '1.3.0', '1.2.2',
+                          '1.2.1',
+                          '1.2.0', '1.1.0', '1.0.0'],
+                         key=_version_to_key, reverse=True),
+        REPO: 'https://github.com/cloudify-cosmo/cloudify-kubernetes-plugin',
     },
 
     # TODO mateumann fill in the rest
@@ -146,90 +157,6 @@ CLOUDIFY_PLUGINS = {
 }
 
 
-# There are some Cloudify helper functions  -->
-
-# def validate_no_active_updates_per_blueprint(
-#         sm: storage_manager.SQLStorageManager,
-#         blueprint: models.Blueprint):
-#     active_updates = sm.list(
-#         models.PluginsUpdate,
-#         filters={'blueprint_id': blueprint.id, 'state': ACTIVE_STATES},
-#         all_tenants=True,
-#     )
-#     if active_updates:
-#         raise Exception(
-#             'There are plugins updates still active, update IDs: '
-#             '{0}'.format(', '.join(u.id for u in active_updates)))
-#
-#
-# def did_plugins_to_install_change(temp_plan: Plan, plan: Plan) -> bool:
-#     # Maintaining backward comparability for older blueprints
-#     if not plan.get(HOST_AGENT_PLUGINS_TO_INSTALL):
-#         plan[HOST_AGENT_PLUGINS_TO_INSTALL] = \
-#             utils.extract_host_agent_plugins_from_plan(plan)
-#     return any(
-#         did_executor_plugins_to_install_change(temp_plan, plan, executor)
-#         for executor in EXECUTORS)
-#
-#
-# def did_executor_plugins_to_install_change(
-#         temp_plan: Plan, plan: Plan, plugins_executor) -> bool:
-#     temp_plugins = temp_plan[plugins_executor]
-#     current_plugins = plan[plugins_executor]
-#     name_to_plugin = {p[PLUGIN_NAME_KEY]: p for p in current_plugins}
-#     return any(plugin for plugin in temp_plugins
-#                if plugin != name_to_plugin.get(plugin[PLUGIN_NAME_KEY], None))
-#
-#
-# def get_reevaluated_plan(rm: resource_manager.ResourceManager,
-#                          blueprint: models.Blueprint):
-#     blueprint_dir = join(
-#         config.instance.file_server_root,
-#         FILE_SERVER_BLUEPRINTS_FOLDER,
-#         blueprint.tenant.name,
-#         blueprint.id)
-#     temp_plan = rm.parse_plan(blueprint_dir,
-#                               blueprint.main_file_name,
-#                               config.instance.file_server_root)
-#     return temp_plan
-#
-#
-# def stage_plugin_update(sm: storage_manager.SQLStorageManager,
-#                         blueprint: models.Blueprint) -> models.PluginsUpdate:
-#     update_id = str(uuid4())
-#     plugins_update = models.PluginsUpdate(
-#         id=update_id,
-#         created_at=utils.get_formatted_timestamp(),
-#         forced=False)
-#     plugins_update.set_blueprint(blueprint)
-#     return sm.put(plugins_update)
-#
-#
-# def create_temp_blueprint_from(sm: storage_manager.SQLStorageManager,
-#                                rm: resource_manager.ResourceManager,
-#                                blueprint: models.Blueprint,
-#                                temp_plan) -> models.Blueprint:
-#     temp_blueprint_id = str(uuid4())
-#     kwargs = {
-#         'application_file_name': blueprint.main_file_name,
-#         'blueprint_id': temp_blueprint_id,
-#         'plan': temp_plan
-#     }
-#     # Make sure not to pass both private resource and visibility
-#     visibility = blueprint.visibility
-#     if visibility:
-#         kwargs['visibility'] = visibility
-#         kwargs['private_resource'] = None
-#     else:
-#         kwargs['visibility'] = None
-#         kwargs['private_resource'] = blueprint.private_resource
-#     temp_blueprint = rm.publish_blueprint_from_plan(**kwargs)
-#     temp_blueprint.is_hidden = True
-#     return sm.update(temp_blueprint)
-
-# These were some Cloudify helper functions  <--
-
-
 def blueprint_file_name(blueprint: models.Blueprint) -> str:
     return join(
         config.instance.file_server_root,
@@ -239,65 +166,49 @@ def blueprint_file_name(blueprint: models.Blueprint) -> str:
         blueprint.main_file_name)
 
 
-# def get_plugin_version(name: str, version: str) -> str:
-#     if name not in CLOUDIFY_PLUGINS:
-#         return version
-#     return CLOUDIFY_PLUGINS[name][VERSIONS][0]
-#
-#
-# def suggest_plugin_versions(plugins: list) -> dict:
-#     suggestions = {}
-#     for plugin in plugins:
-#         suggestions[plugin[PLUGIN_PACKAGE_NAME]] = {
-#             OLD: plugin[PLUGIN_PACKAGE_VERSION],
-#             SUGGESTED: get_plugin_version(
-#                 plugin[PLUGIN_PACKAGE_NAME], plugin[PLUGIN_PACKAGE_VERSION]),
-#         }
-#     return suggestions
+def spec_from_url(url: str) -> tuple:
+    response = requests.get(url)
+    if response.status_code != 200:
+        return None, None
+    try:
+        plugin_yaml = yaml.safe_load(response.text)
+    except yaml.YAMLError as ex:
+        print(f'Cannot load imports from {url}: {ex}')
+        return None, None
+    for _, spec in plugin_yaml.get('plugins', {}).items():
+        if spec.get(PLUGIN_PACKAGE_NAME) and \
+                spec.get(PLUGIN_PACKAGE_VERSION):
+            return spec[PLUGIN_PACKAGE_NAME], \
+                   spec[PLUGIN_PACKAGE_VERSION]
 
 
-# def plugin_source(name: str, version: str) -> str:
-#     if name not in CLOUDIFY_PLUGINS:
-#         return None
-#     return CLOUDIFY_PLUGINS[name][REPO] + f'/archive/{version}.zip'
+def spec_from_import(plugin_line: str) -> tuple:
+    # More or less copy of ResolverWithCatalogSupport._resolve_plugin_yaml_url
+    spec = plugin_line.replace('plugin:', '', 1).strip()
+    name, _, params = spec.partition('?')
+    for filter_name, filter_value in parse_qs(params).items():
+        if filter_name == 'version':
+            if len(filter_value) == 1:
+                return name, filter_value[0].strip()
+            else:
+                return name, None
+    return name, None
 
 
-def substitude_plugins(plugins: list, plugin_suggestions: dict) -> list:
-    result = []
-    for plugin in plugins:
-        if plugin[PLUGIN_PACKAGE_NAME] in plugin_suggestions:
-            suggestion = plugin_suggestions[plugin[PLUGIN_PACKAGE_NAME]]
-            plugin[PLUGIN_PACKAGE_VERSION] = suggestion[SUGGESTED]
-            plugin[SOURCE] = plugin_source(plugin[PLUGIN_PACKAGE_NAME],
-                                           plugin[PLUGIN_PACKAGE_VERSION])
-        result.append(plugin)
-    return result
-
-
-# def reevaluate_plugins_to_be_updated(blueprint: models.Blueprint,
-#                                      temp_plan: Plan,
-#                                      minor_only: bool,
-#                                      plugin_names: tuple,
-#                                      minor_except_names: tuple) -> Plan:
-#     plugins_installed = list_plugins_in_a_plan(temp_plan)
-#     if plugin_names:
-#         plugins_installed = [p for p in plugins_installed
-#                              if p[PACKAGE_NAME] in plugin_names]
-#     if not plugins_installed:
-#         return temp_plan
-#     plugins_update_suggestions = suggest_plugin_versions(plugins_installed,
-#                                                          minor_only,
-#                                                          minor_except_names)
-#     if not plugins_update_suggestions:
-#         return temp_plan
-#
-#     # update plugins the plan
-#     for executor in EXECUTORS:
-#         if executor not in temp_plan:
-#             continue
-#         temp_plan[executor] = substitude_plugins(temp_plan[executor],
-#                                                  plugins_update_suggestions)
-#     return temp_plan
+def plugin_spec(import_line: str) -> tuple:
+    if import_line.startswith('http://') or \
+            import_line.startswith('https://'):
+        name, version = spec_from_url(import_line)
+        return IS_PINNED, IS_NOT_UNKNOWN, name, version
+    elif import_line.startswith('plugin:'):
+        name, version = spec_from_import(import_line)
+        if version and version.startswith('>'):
+            return IS_NOT_PINNED, IS_NOT_UNKNOWN, name, version
+        elif not version:
+            return IS_NOT_PINNED, IS_NOT_UNKNOWN, name, version
+        else:
+            return IS_PINNED, IS_NOT_UNKNOWN, name, version
+    return IS_NOT_PINNED, IS_UNKNOWN, None, None
 
 
 def plugins_in_a_plan(plan: Plan, plugin_names: tuple) -> collections.Iterable:
@@ -315,29 +226,29 @@ def plugins_in_a_plan(plan: Plan, plugin_names: tuple) -> collections.Iterable:
                 yield plugin
 
 
-def import_line(imports: list, plugin_name: str) -> str:
-    for line in imports:
-        if plugin_name in line:
-            return line
+def find_plugin_in_a_plan(plan: Plan,
+                          plugin_names: tuple,
+                          plugin_name: str) -> dict:
+    for plugin in plugins_in_a_plan(plan, plugin_names):
+        if plugin[PLUGIN_PACKAGE_NAME] == plugin_name:
+            return plugin
 
 
-def suggest_version(plugin: dict, blueprint_line: str) -> str:
-
-    def get_plugin_version(name: str, version: str) -> str:
-        if name not in CLOUDIFY_PLUGINS:
-            return version
-        return CLOUDIFY_PLUGINS[name][VERSIONS][0]
-
-    return get_plugin_version(plugin[PLUGIN_PACKAGE_NAME],
-                              plugin[PLUGIN_PACKAGE_VERSION])
+def suggest_version(plugin_name: str, plugin_version: str) -> str:
+    if plugin_name not in CLOUDIFY_PLUGINS:
+        return plugin_version
+    return CLOUDIFY_PLUGINS[plugin_name][VERSIONS][0]
 
 
-def scan_blueprint(sm: storage_manager.SQLStorageManager,
-                   rm: resource_manager.ResourceManager,
-                   blueprint: models.Blueprint,
+def scan_blueprint(blueprint: models.Blueprint,
                    plugin_names: tuple) -> dict:
+    def add_mapping(mappings: dict, genre: str, content: object) -> dict:
+        if genre not in mappings:
+            mappings[genre] = []
+        mappings[genre].append(content)
+        return mappings
+
     file_name = blueprint_file_name(blueprint)
-    import pdb; pdb.set_trace()  # noqa
     try:
         with open(file_name, 'r') as f:
             try:
@@ -345,27 +256,40 @@ def scan_blueprint(sm: storage_manager.SQLStorageManager,
             except yaml.YAMLError as ex:
                 print(f'Cannot load imports from {file_name}: {ex}')
                 return {}
-    except FileNotFoundError as ex:
+    except FileNotFoundError:
         print(f'Blueprint file {file_name} does not exist')
         return {}
-    print(f'imports {imports}')
     mappings = {}
-    for plugin in plugins_in_a_plan(blueprint.plan, plugin_names):
-        if plugin[PLUGIN_PACKAGE_NAME] in mappings:
+    for import_line in imports:
+        is_pinned_version, is_unknown, plugin_name, plugin_version = \
+            plugin_spec(import_line)
+        if plugin_names and plugin_name not in plugin_names:
             continue
-        blueprint_line = import_line(imports, plugin[PLUGIN_PACKAGE_NAME])
-        mappings[plugin[PLUGIN_PACKAGE_NAME]] = {
-            CURRENT: plugin[PLUGIN_PACKAGE_VERSION],
-            BLUEPRINT_LINE: blueprint_line,
-            SUGGESTED: suggest_version(plugin, blueprint_line),
-        }
-    print(f'blueprint file name: {file_name}')
+        if is_unknown:
+            if not import_line.endswith('/types.yaml'):
+                mappings = add_mapping(mappings, UNKNOWN, import_line)
+            continue
+        if not is_pinned_version:
+            mappings = add_mapping(mappings, FINE, import_line)
+            continue
+        suggested_version = suggest_version(plugin_name, plugin_version)
+        if not suggested_version:
+            mappings = add_mapping(mappings, UNKNOWN, import_line)
+            continue
+        plugin_in_plan = find_plugin_in_a_plan(
+            blueprint.plan, plugin_names, plugin_name
+        )
+        mappings = add_mapping(mappings, plugin_name, {
+            'import_line': import_line,
+            CURRENT_VERSION: plugin_in_plan[PLUGIN_PACKAGE_VERSION],
+            SUGGESTED_VERSION: suggested_version,
+        })
     return mappings
 
 
 @click.command()
 @click.option('--tenant', default='default_tenant',
-              help='Tenant name')
+              help='Tenant name', )
 @click.option('--plugin-name', 'plugin_names',
               multiple=True, help='Plugin(s) to update (you can provide '
                                   'multiple --plugin-name(s).')
@@ -384,14 +308,17 @@ def main(tenant, plugin_names, blueprint_ids, mapping_file, correct):
 
     set_tenant_in_app(get_tenant_by_name(tenant))
     _sm = get_storage_manager()
-    _rm = get_resource_manager(_sm)
     filters = {'id': blueprint_ids} if blueprint_ids else None
-    #          = _sm.list(models.Blueprint, filters=filters, all_tenants=True)
     blueprints = _sm.list(models.Blueprint, filters=filters)
+    mappings = {}
     for b in blueprints.items:
         print(f'Processing {b.id} blueprint')
-        mapping = scan_blueprint(_sm, _rm, b, plugin_names)
-        print(f'mapping {mapping}')
+        mapping = scan_blueprint(b, plugin_names)
+        if not mapping:
+            continue
+        mappings[b.id] = mapping
+    with open('/tmp/mappings.yaml', 'w') as f:
+        yaml.dump(mappings, f, default_flow_style=False)
 
 
 if __name__ == '__main__':
