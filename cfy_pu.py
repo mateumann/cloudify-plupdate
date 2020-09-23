@@ -33,20 +33,16 @@ EXECUTORS = [DEPLOYMENT_PLUGINS_TO_INSTALL,
              WORKFLOW_PLUGINS_TO_INSTALL,
              HOST_AGENT_PLUGINS_TO_INSTALL]
 
-FILE_NAME = 'file-name'
 FINE = 'fine'
 IMPORTS = 'imports'
 IS_PINNED = True
 IS_NOT_PINNED = False
 IS_UNKNOWN = True
 IS_NOT_UNKNOWN = False
-PINNED = 'pinned'
 REPO = 'repository'
-SOURCE = 'source'
-SUGGESTED_LINE = 'suggested_line'
 SUGGESTED_VERSION = 'suggested_version'
-UNHANDLED = 'unhandled'
 UNKNOWN = 'unknown'
+UPDATES = 'updates'
 VERSIONS = 'versions'
 
 
@@ -241,7 +237,7 @@ def suggest_version(plugin_name: str, plugin_version: str) -> str:
 
 
 def scan_blueprint(blueprint: models.Blueprint,
-                   plugin_names: tuple) -> dict:
+                   plugin_names: tuple) -> tuple:
     def add_mapping(mappings: dict, genre: str, content: object) -> dict:
         if genre not in mappings:
             mappings[genre] = []
@@ -255,11 +251,12 @@ def scan_blueprint(blueprint: models.Blueprint,
                 imports = yaml.safe_load(f)[IMPORTS]
             except yaml.YAMLError as ex:
                 print(f'Cannot load imports from {file_name}: {ex}')
-                return {}
+                return None, None
     except FileNotFoundError:
         print(f'Blueprint file {file_name} does not exist')
-        return {}
+        return None, None
     mappings = {}
+    plugins_install_suggestions = {}
     for import_line in imports:
         is_pinned_version, is_unknown, plugin_name, plugin_version = \
             plugin_spec(import_line)
@@ -269,22 +266,26 @@ def scan_blueprint(blueprint: models.Blueprint,
             if not import_line.endswith('/types.yaml'):
                 mappings = add_mapping(mappings, UNKNOWN, import_line)
             continue
-        if not is_pinned_version:
-            mappings = add_mapping(mappings, FINE, import_line)
-            continue
         suggested_version = suggest_version(plugin_name, plugin_version)
         if not suggested_version:
             mappings = add_mapping(mappings, UNKNOWN, import_line)
             continue
+        if plugin_name not in plugins_install_suggestions:
+            plugins_install_suggestions[plugin_name] = suggested_version
+        if not is_pinned_version:
+            mappings = add_mapping(mappings, FINE, import_line)
+            continue
         plugin_in_plan = find_plugin_in_a_plan(
             blueprint.plan, plugin_names, plugin_name
         )
-        mappings = add_mapping(mappings, plugin_name, {
-            'import_line': import_line,
-            CURRENT_VERSION: plugin_in_plan[PLUGIN_PACKAGE_VERSION],
-            SUGGESTED_VERSION: suggested_version,
+        mappings = add_mapping(mappings, UPDATES, {
+            plugin_name: {
+                'import_line': import_line,
+                CURRENT_VERSION: plugin_in_plan[PLUGIN_PACKAGE_VERSION],
+                SUGGESTED_VERSION: suggested_version,
+            }
         })
-    return mappings
+    return mappings, plugins_install_suggestions
 
 
 @click.command()
@@ -310,15 +311,19 @@ def main(tenant, plugin_names, blueprint_ids, mapping_file, correct):
     _sm = get_storage_manager()
     filters = {'id': blueprint_ids} if blueprint_ids else None
     blueprints = _sm.list(models.Blueprint, filters=filters)
-    mappings = {}
+    mappings, install_suggestions = {}, {}
     for b in blueprints.items:
         print(f'Processing {b.id} blueprint')
-        mapping = scan_blueprint(b, plugin_names)
-        if not mapping:
-            continue
-        mappings[b.id] = mapping
+        mapping, install_suggestion = scan_blueprint(b, plugin_names)
+        if install_suggestion:
+            install_suggestions.update(install_suggestion)
+        if mapping:
+            mappings[b.id] = mapping
     with open(mapping_file, 'w') as f:
         yaml.dump(mappings, f, default_flow_style=False)
+    from pprint import pprint
+    print(f'Make sure those plugins are installed (in suggested versions):')
+    pprint(install_suggestions)
 
 
 if __name__ == '__main__':
