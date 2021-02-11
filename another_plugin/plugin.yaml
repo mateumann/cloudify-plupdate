@@ -1,0 +1,40 @@
+plugins:
+    another_plugin:
+        executor: central_deployment_agent
+        package_name: another-plugin
+        package_version: 0.0.4
+        source: null
+        install: true
+
+node_types:
+  cloudify.another.nodes.File:
+    derived_from: cloudify.nodes.Root
+    properties:
+      path:
+        description: >
+            Where the test file should be created.
+            The instance ID will be appended to this.
+            e.g. /tmp/another_plugin_test_file_nodename_a123ff
+        default: /tmp/another_plugin_test_file
+      content:
+        description: What the contents of the test file should be.
+        default: This is a test file.
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: another_plugin.another_plugin.file.create
+          inputs: {}
+        delete:
+          implementation: another_plugin.another_plugin.file.delete
+          inputs: {}
+
+  cloudify.another.nodes.Wait:
+    derived_from: cloudify.nodes.Root
+    properties:
+      delay:
+        description: How long to wait for, in seconds.
+        default: 60
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: another_plugin.another_plugin.wait.wait
